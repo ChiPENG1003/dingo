@@ -1,0 +1,129 @@
+data:
+  waveform_dataset_path: training_data/waveform_dataset_ET_joint_separate_5M.hdf5
+  train_fraction: 0.95
+  domain_update:
+    f_min: 20.0    # the dataset goes down to 10 Hz; raise/lower here to trade cost for band
+    f_max: 1024.0
+  detectors:
+    - ET1
+    - ET2
+    - ET3
+  extrinsic_prior:  # signal 1, sampled at train time
+    dec: default
+    ra: default
+    geocent_time: bilby.core.prior.Uniform(minimum=-0.10, maximum=0.10, name='geocent_time')
+    psi: default
+    luminosity_distance: bilby.core.prior.Uniform(minimum=5000.0, maximum=50000.0, name='luminosity_distance')
+
+  overlapping_signals:
+    suffixes: ["_2"]
+    time_offset_prior: bilby.core.prior.Uniform(minimum=0.01, maximum=0.5, name='delta_tc_2')
+
+  ref_time: 1126259462.391
+  gnpe_time_shifts:
+    kernel: bilby.core.prior.Uniform(minimum=-0.00005, maximum=0.00005)
+    exact_equiv: True
+  inference_parameters:
+    # --- signal 1 ---
+    - chirp_mass
+    - mass_ratio
+    - chi_eff
+    - luminosity_distance
+    - geocent_time
+    - ra
+    - dec
+    - psi
+    # --- signal 2 (Earlier merger) ---
+    - chirp_mass_2
+    - mass_ratio_2
+#    - chi_eff_2        # needs suffix support in dingo/gw/derived_parameters.py
+    - luminosity_distance_2
+    - ra_2
+    - dec_2
+    - psi_2
+    - delta_tc_2
+#    - theta_jn
+#    - theta_jn_2
+
+# Model architecture
+model:
+  posterior_model_type: normalizing_flow
+  # kwargs for neural spline flow
+  posterior_kwargs:
+    num_flow_steps: 30
+    base_transform_kwargs:
+      hidden_dim: 1024
+      num_transform_blocks: 5
+      activation: elu
+      dropout_probability: 0.0
+      batch_norm: True
+      num_bins: 8
+      base_transform_type: rq-coupling
+  # kwargs for embedding net
+  embedding_kwargs:
+    output_dim: 128
+    hidden_dims: [1024, 1024, 1024, 1024, 1024, 1024,
+                  512, 512, 512, 512, 512, 512,
+                  256, 256, 256, 256, 256, 256,
+                  128, 128, 128, 128, 128, 128]
+    activation: elu
+    dropout: 0.0
+    batch_norm: True
+    svd:
+      num_training_samples: 20000
+      num_validation_samples: 5000
+      size: 200
+
+training:
+  stage_0:
+    epochs: 300
+    asd_dataset_path: training_data/asd_dataset_ET/asds_ET.hdf5 # ET-D is deterministic: one ASD per detector
+    freeze_rb_layer: True
+    optimizer:
+      type: adam
+      lr: 1.0e-4
+    scheduler:
+      type: cosine
+      T_max: 300
+    batch_size: 1024
+    
+    early_stopping:
+      patience: 20
+      delta: 0.02
+      metric: validation # one of ['training, validation']
+
+  stage_1:
+    epochs: 150
+    asd_dataset_path: training_data/asd_dataset_ET/asds_ET.hdf5
+    freeze_rb_layer: False
+    optimizer:
+      type: adam
+      lr: 3.0e-5
+    scheduler:
+      type: cosine
+      T_max: 150
+    batch_size: 512
+    
+    early_stopping:
+      patience: 20
+      delta: 0.01
+      metric: validation # one of ['training, validation']
+
+
+# Local settings for training that have no impact on the final trained network.
+local:
+  device: cuda # Change this to 'cuda' for training on a GPU.
+  num_workers: 16  # num_workers >0 does not work on Mac, see https://stackoverflow.com/questions/64772335/pytorch-w-parallelnative-cpp206
+  runtime_limits:
+    max_time_per_run: 3600000
+    max_epochs_per_run: 500
+  checkpoint_epochs: 25
+  leave_waveforms_on_disk: True
+  local_cache_path: /tmp # cache waveforms to local node disk to avoid BeeGFS network traffic during training
+  # Local settings related to condor, remove if not used on cluster
+  condor:
+    num_cpus: 16
+    memory_cpus: 128000
+    num_gpus: 1
+    memory_gpus: 8000
+    request_disk: 50GB

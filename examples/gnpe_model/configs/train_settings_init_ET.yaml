@@ -1,23 +1,28 @@
+# GNPE initialization network for the Einstein Telescope (ET-D design sensitivity).
+# Regresses the three detector coalescence times, which seed the GNPE loop of
+# train_settings_ET.yaml. Counterpart of train_settings_init.yaml (H1/L1, O2).
 data:
-  waveform_dataset_path: training_data/waveform_dataset.hdf5  # Contains intrinsic waveforms
+  waveform_dataset_path: training_data/waveform_dataset_ET_1M.hdf5  # Contains intrinsic waveforms
   train_fraction: 0.95
   domain_update:
-    f_min: 20.0
+    f_min: 10.0
     f_max: 1024.0
   svd_size_update: 200  # Optionally, reduce the SVD size when decompressing (for performance)
   detectors:
-    - H1
-    - L1
+    - ET1
+    - ET2
+    - ET3
   extrinsic_prior:  # Sampled at train time
     dec: default
     ra: default
     geocent_time: bilby.core.prior.Uniform(minimum=-0.10, maximum=0.10, name='geocent_time')
     psi: default
-    luminosity_distance: bilby.core.prior.Uniform(minimum=100.0, maximum=1000.0, name='luminosity_distance')
+    luminosity_distance: bilby.core.prior.Uniform(minimum=5000.0, maximum=50000.0, name='luminosity_distance')
   ref_time: 1126259462.391
   inference_parameters:
-  - H1_time
-  - L1_time
+  - ET1_time
+  - ET2_time
+  - ET3_time
 
 # Model architecture
 model:
@@ -38,54 +43,39 @@ model:
     output_dim: 128
     hidden_dims: [512, 512, 512, 512, 512, 512,
     256, 256, 256, 256, 256, 256,
-    128, 128, 128, 128, 128, 128
-    ]
+    128, 128, 128, 128, 128, 128]
     activation: elu
     dropout: 0.0
     batch_norm: True
     svd:
-      num_training_samples: 50000
-      num_validation_samples: 10000
+      num_training_samples: 20000
+      num_validation_samples: 5000
       size: 200
 
 # Training is divided in stages. They each require all settings as indicated below.
 training:
   stage_0:  # Pre-training stage (fixed ASD, typically)
     epochs: 150
-    asd_dataset_path: training_data/asd_dataset_fiducial/asds_O1_fiducial.hdf5 # This should just contain a single 'fiducial' ASD for each detector.
+    asd_dataset_path: training_data/asd_dataset_ET/asds_ET.hdf5 # ET-D is deterministic: one ASD per detector
     freeze_rb_layer: True
     optimizer:
       type: adam
-      lr: 5.0e-5
+      lr: 1.0e-4
     scheduler:
       type: cosine
       T_max: 150
-    batch_size: 4096
-
-  stage_1:  # Fine-tuning stage
-    epochs: 75
-    asd_dataset_path: training_data/asd_dataset/asds_O1.hdf5 # This should contain a large collection of ASDs for each detector.
-    freeze_rb_layer: False
-    optimizer:
-      type: adam
-      lr: 1.0e-5
-    scheduler:
-      type: cosine
-      T_max: 75
-    batch_size: 4096
+    batch_size: 2048  # needs >10GB VRAM
 
 # Local settings for training that have no impact on the final trained network.
 local:
-  device: cpu  # Change this to 'cuda' for training on a GPU.
+  device: cuda  # Change this to 'cuda' for training on a GPU.
   num_workers: 6  # num_workers >0 does not work on Mac, see https://stackoverflow.com/questions/64772335/pytorch-w-parallelnative-cpp206
-  use_wandb: True
-  wandb_api_key:  # insert_here for monitoring many runs. Can be obtained from https://wandb.ai/settings
   runtime_limits:
     max_time_per_run: 3600000
     max_epochs_per_run: 500
   checkpoint_epochs: 10
   leave_waveforms_on_disk: True
-  # local_cache_path: tmp # uncomment to avoid slow data loading during training due to network traffic on cluster
+  local_cache_path: /tmp # cache waveforms to local node disk to avoid BeeGFS network traffic during training
   condor:
     num_cpus: 16
     memory_cpus: 128000

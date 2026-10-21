@@ -56,6 +56,12 @@ class GNPEBase(ABC):
             proxies[k + "_proxy"] = g_hat
         return proxies
 
+    def kernel_log_prob(self, samples):
+        gnpe_proxies_diff = {
+            k: np.array(samples[k] - samples[f"{k}_proxy"]) for k in self.kernel
+        }
+        return self.kernel.ln_prob(gnpe_proxies_diff, axis=0)
+
     def perturb(self, g, k):
         """
         Generate proxy variables based on initial parameter values.

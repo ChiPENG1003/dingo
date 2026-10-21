@@ -4,7 +4,6 @@ import numpy as np
 import pandas as pd
 from astropy.time import Time
 from bilby.core.prior import PriorDict, DeltaFunction, Constraint
-from bilby.gw.detector import InterferometerList
 from torchvision.transforms import Compose
 
 from dingo.core.samplers import Sampler, GNPESampler
@@ -16,7 +15,7 @@ from dingo.gw.domains import (
     Domain,
 )
 from dingo.gw.domains import build_domain
-from dingo.gw.gwutils import get_extrinsic_prior_dict
+from dingo.gw.gwutils import get_extrinsic_prior_dict, get_ifo_list
 from dingo.gw.prior import build_prior_with_defaults
 from dingo.gw.result import Result
 from dingo.gw.transforms import (
@@ -421,7 +420,7 @@ class GWSamplerGNPE(GWSamplerMixin, GNPESampler):
         Builds the transforms that are used in the GNPE loop.
         """
         data_settings = self.metadata["train_settings"]["data"]
-        ifo_list = InterferometerList(data_settings["detectors"])
+        ifo_list = get_ifo_list(data_settings["detectors"])
 
         gnpe_time_settings = data_settings.get("gnpe_time_shifts")
         gnpe_chirp_settings = data_settings.get("gnpe_chirp")
@@ -465,10 +464,12 @@ class GWSamplerGNPE(GWSamplerMixin, GNPESampler):
 
         # Extract GNPE information (list of parameters, dict of kernels) from the
         # transforms.
+        self.gnpe_transforms = []
         self.gnpe_parameters = []
         self.gnpe_kernel = PriorDict()
         for transform in transform_pre:
             if isinstance(transform, GNPEBase):
+                self.gnpe_transforms.append(transform)
                 self.gnpe_parameters += transform.input_parameter_names
                 for k, v in transform.kernel.items():
                     self.gnpe_kernel[k] = v
@@ -499,14 +500,11 @@ class GWSamplerGNPE(GWSamplerMixin, GNPESampler):
         )
 
     def _kernel_log_prob(self, samples):
-        # TODO: Reimplement as a method of GNPEBase.
         if len({"chirp_mass", "mass_ratio", "phase"} & self.gnpe_kernel.keys()) > 0:
             raise NotImplementedError("kernel log_prob only implemented for time gnpe.")
-        gnpe_proxies_diff = {
-            k: np.array(samples[k] - samples[f"{k}_proxy"])
-            for k in self.gnpe_kernel.keys()
-        }
-        return self.gnpe_kernel.ln_prob(gnpe_proxies_diff, axis=0)
+        return sum(
+            transform.kernel_log_prob(samples) for transform in self.gnpe_transforms
+        )
 
 
 # Functions for frequency cropping. Used by Sampler classes and dingo-pipe.

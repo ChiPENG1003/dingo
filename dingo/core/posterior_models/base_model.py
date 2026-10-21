@@ -397,6 +397,7 @@ class BasePosteriorModel(ABC):
             print(f"test loss: {test_loss:.3f}")
 
         else:
+            run_start = time.time()
             while not runtime_limits.limits_exceeded(self.epoch):
                 self.epoch += 1
 
@@ -466,7 +467,33 @@ class BasePosteriorModel(ABC):
                     if early_stopping.early_stop:
                         print("Early stopping")
                         break
-                print(f"Finished training epoch {self.epoch}.\n")
+                elapsed_min, elapsed_sec = divmod(time.time() - run_start, 60)
+                print(f"Finished training epoch {self.epoch}. Elapsed: {elapsed_min:.0f}:{elapsed_sec:02.0f} min.\n")
+
+
+def _apply_lr_warmup(pm):
+    """
+    Linearly ramp the learning rate over the first steps of a training stage.
+
+    A freshly built Adam has no second-moment estimate yet, so its first update is
+    ~lr * sign(grad) on every parameter, whatever the size of the gradient. At the
+    stage_0 -> stage_1 boundary of the ET run that single step took the training
+    loss from -10.94 to -6.40. Ramping the lr up from ~0 lets the moment estimates
+    settle before full-size steps are taken.
+
+    initialize_stage() sets pm.lr_warmup at the start of a stage; this consumes it
+    and removes it once the ramp is done, restoring the exact target lr so the
+    epoch-level scheduler continues from the right value.
+    """
+    warmup = getattr(pm, "lr_warmup", None)
+    if not warmup:
+        return
+    warmup["step"] += 1
+    frac = min(1.0, warmup["step"] / warmup["steps"])
+    for group, target in zip(pm.optimizer.param_groups, warmup["target_lrs"]):
+        group["lr"] = target * frac
+    if warmup["step"] >= warmup["steps"]:
+        pm.lr_warmup = None
 
 
 def train_epoch(pm, dataloader):
@@ -488,6 +515,7 @@ def train_epoch(pm, dataloader):
         loss = pm.loss(data[0], *data[1:])
         # backward pass and optimizer step
         loss.backward()
+        _apply_lr_warmup(pm)
         pm.optimizer.step()
         # update loss for history and logging
         loss_info.update(loss.detach().item(), len(data[0]))
