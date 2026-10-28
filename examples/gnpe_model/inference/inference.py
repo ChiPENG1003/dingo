@@ -19,6 +19,7 @@ from dingo.gw.inference.gw_samplers import GWSamplerGNPE, GWSampler
 from dingo.gw.noise.asd_dataset import ASDDataset
 from dingo.gw.prior import build_prior_with_defaults
 from dingo.gw.transforms import GetDetectorTimes, PostCorrectGeocentTime
+from dingo.gw.transforms.overlap_transforms import finite_window_time_shift
 from torchvision.transforms import Compose
 
 INFERENCE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -533,22 +534,7 @@ def _print_truth(theta, header):
 
 
 def _linear_time_shift(domain, h_freq, shift_seconds):
-    h_freq = np.asarray(h_freq)
-    n = 2 * (len(h_freq) - 1)
-    fs = n * domain.delta_f
-    ht = np.fft.irfft(h_freq, n=n)
-    m = int(np.argmax(np.abs(ht)))
-    contiguous = np.roll(ht, (n - 1) - m)  # merger at last sample
-    k = int(round(float(shift_seconds) * fs))  # >0 => earlier
-    shifted = np.zeros_like(contiguous)
-    if 0 < k < n:
-        shifted[: n - k] = contiguous[k:]  # drop earliest k samples of inspiral
-    elif -n < k <= 0:
-        s = -k
-        shifted[s:] = contiguous[: n - s]
-    # |k| >= n: signal fully shifted out of the segment -> all zeros
-    out = np.roll(shifted, m - (n - 1))  # back to original buffer frame
-    return np.fft.rfft(out, n=n)
+    return finite_window_time_shift(domain, h_freq, shift_seconds)
 
 
 def _build_injection(injection_generator, theta, theta2=None, shift_seconds=None):

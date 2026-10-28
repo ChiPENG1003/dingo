@@ -32,6 +32,36 @@ from dingo.gw.transforms.utils import get_batch_size_of_input_sample
 SIGNAL_EXTRINSIC_PARAMETERS = ["ra", "dec", "psi", "luminosity_distance", "geocent_time"]
 
 
+def finite_window_time_shift(domain, frequency_strain, seconds):
+    """Move a merger earlier by ``seconds`` without wrapping strain across the 8 s window.
+
+    This is the vectorized version of the overlap injection's ``_linear_time_shift``.
+    The last axis holds the rFFT bins; any preceding axes are batch dimensions.
+    """
+    frequency_strain = np.asarray(frequency_strain)
+    n = 2 * (frequency_strain.shape[-1] - 1)
+    samples = np.fft.irfft(frequency_strain, n=n, axis=-1)
+    shift = np.broadcast_to(
+        np.rint(np.asarray(seconds) * n * domain.delta_f).astype(int),
+        samples.shape[:-1],
+    )
+    peak = np.argmax(np.abs(samples), axis=-1)
+    indices = np.arange(n)
+    contiguous = np.take_along_axis(
+        samples, (indices + np.expand_dims(peak, -1) + 1) % n, axis=-1
+    )
+    source = indices + np.expand_dims(shift, -1)
+    moved = np.where(
+        (source >= 0) & (source < n),
+        np.take_along_axis(contiguous, np.clip(source, 0, n - 1), axis=-1),
+        0,
+    )
+    restored = np.take_along_axis(
+        moved, (indices + n - 1 - np.expand_dims(peak, -1)) % n, axis=-1
+    )
+    return np.fft.rfft(restored, n=n, axis=-1)
+
+
 class SampleExtrinsicParametersForSignal(object):
     """
     Sample an independent set of extrinsic parameters for an additional signal.
@@ -151,7 +181,9 @@ class ApplyGNPEShiftToSignal(object):
 class ProjectOntoDetectorsAndSum(object):
     """
     Project each signal onto the detectors with its own extrinsic parameters, then add
-    the resulting strains.
+    the resulting strains. A signal with ``delta_tc<suffix>`` is first projected at
+    its unshifted reference time and then moved earlier with the exact finite-window
+    convention used to build the overlap injections.
 
     This is the point at which the overlap is formed. Summing here rather than at the
     polarization level is what lets the two sources have different sky positions,
@@ -187,6 +219,10 @@ class ProjectOntoDetectorsAndSum(object):
 
         strains = None
         for suffix in self.suffixes:
+            offset = extrinsic_parameters.get(f"delta_tc{suffix}") if suffix else None
+            # The stored second-signal time already includes -offset. Undo it for
+            # projection, then apply the finite-window shift after projection.
+            # This also preserves the GNPE proxy applied to detector times above.
             sub = {
                 "waveform": {
                     pol: sample["waveform"][pol + suffix]
@@ -200,14 +236,26 @@ class ProjectOntoDetectorsAndSum(object):
                     for k in ("luminosity_distance", "geocent_time")
                 },
                 "extrinsic_parameters": {
-                    **{k: extrinsic_parameters[k + suffix]
+                    **{k: (extrinsic_parameters[k + suffix] + offset
+                           if offset is not None and k == "geocent_time"
+                           else extrinsic_parameters[k + suffix])
                        for k in SIGNAL_EXTRINSIC_PARAMETERS},
                     **{f"{ifo.name}_time":
-                       extrinsic_parameters[f"{ifo.name}{suffix}_time"]
+                       (extrinsic_parameters[f"{ifo.name}{suffix}_time"] + offset
+                        if offset is not None
+                        else extrinsic_parameters[f"{ifo.name}{suffix}_time"])
                        for ifo in self.ifo_list},
                 },
             }
             out = self._project(sub)
+            if offset is not None:
+                out["waveform"] = {
+                    name: finite_window_time_shift(self.domain, strain, offset)
+                    for name, strain in out["waveform"].items()
+                }
+                out["parameters"]["geocent_time"] -= offset
+                for ifo in self.ifo_list:
+                    out["parameters"][f"{ifo.name}_time"] -= offset
             if strains is None:
                 strains = out["waveform"]
             else:

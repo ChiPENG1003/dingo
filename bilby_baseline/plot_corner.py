@@ -100,6 +100,19 @@ def load_truth(path):
         return {k: float(grp[k][()]) for k in grp.keys()}
 
 
+def load_second_truth(path):
+    """Read the second injection at its effective, post-shift merger time."""
+    import h5py
+    with h5py.File(path, "r") as f:
+        if "injection_parameters_2" not in f:
+            return None
+        grp = f["injection_parameters_2"]
+        truth = {k: float(grp[k][()]) for k in grp.keys()}
+        if "geocent_time" in truth and "shift_seconds" in grp.attrs:
+            truth["geocent_time"] -= float(grp.attrs["shift_seconds"])
+        return truth
+
+
 def get_t_ref(truth_path, times):
     if truth_path is not None and not truth_path.endswith(".json"):
         try:
@@ -195,7 +208,8 @@ def print_summary(name, df, params, truth_vals):
         print(f"{p:>22} {med:>12.4f} {lo:>12.4f} {hi:>12.4f} {truth_text:>12}")
 
 
-def plot_marginals(frames, params, labels, axis_labels, ranges, truth_vals, bw, out):
+def plot_marginals(frames, params, labels, axis_labels, ranges, truth_vals, bw, out,
+                   second_truth_vals=None, selected_signal=None):
     """Write a standalone row of 1D posterior marginal KDEs."""
     fig, axes = plt.subplots(1, len(params), figsize=(4.5 * len(params), 4.0),
                              squeeze=False)
@@ -223,11 +237,17 @@ def plot_marginals(frames, params, labels, axis_labels, ranges, truth_vals, bw, 
                 # posterior as a vertical line instead.
                 ax.axvline(values[0], color=color, lw=1.5, label=label)
         if truth_vals is not None and truth_vals[i] is not None:
-            ax.axvline(truth_vals[i], ls="--", label="truth")
+            ax.axvline(truth_vals[i], color=("crimson" if selected_signal else "royalblue"),
+                       ls=("-" if selected_signal else "--"),
+                       label=(f"signal {selected_signal} truth" if selected_signal
+                              else "signal 1 truth"))
+        if second_truth_vals is not None and second_truth_vals[i] is not None:
+            ax.axvline(second_truth_vals[i], color="crimson", ls="-",
+                       label="signal 2 truth")
         ax.set_xlim(*rng)
         ax.set_xlabel(axis_label)
         ax.set_ylabel("posterior density" if i == 0 else "")
-        if len(frames) > 1 or truth_vals is not None:
+        if len(frames) > 1 or truth_vals is not None or second_truth_vals is not None:
             ax.legend(frameon=False)
     fig.tight_layout()
     fig.savefig(out, dpi=200, bbox_inches="tight")
@@ -248,6 +268,10 @@ def main():
     ap.add_argument("--truth", default=None,
                     help="Injection hdf5 (with an injection_parameters group) or "
                          "a truth json, drawn as truth lines.")
+    ap.add_argument("--signal", type=int, choices=(1, 2), default=None,
+                    help="For a joint Bilby result, plot one signal against its "
+                         "own injection truth. Signal 2's geocent_time is derived "
+                         "from geocent_time - delta_tc_2.")
     ap.add_argument("--t-ref", type=float, default=None,
                     help=f"Reference GPS time subtracted from geocent_time "
                          f"(default: read from --truth, else {DEFAULT_T_REF}).")
@@ -277,6 +301,16 @@ def main():
         print(f"loading {p}")
         results.append(load_result(p))
 
+    if args.signal == 2:
+        for res in results:
+            if "geocent_time_2" not in res.posterior.columns:
+                needed = {"geocent_time", "delta_tc_2"}
+                if not needed.issubset(res.posterior.columns):
+                    sys.exit("signal 2 time requires geocent_time and delta_tc_2")
+                res.posterior["geocent_time_2"] = (
+                    res.posterior["geocent_time"] - res.posterior["delta_tc_2"]
+                )
+
     params = ([s.strip() for s in args.params.split(",") if s.strip()]
               if args.params else default_parameters(results[0]))
     for res, p in zip(results, paths):
@@ -295,13 +329,24 @@ def main():
     if times is not None and not args.absolute_time:
         print(f"  geocent_time plotted as t_c - {t_ref}")
     truth = load_truth(args.truth) if args.truth else None
+    second_truth = (load_second_truth(args.truth)
+                    if args.truth and args.truth.endswith((".hdf5", ".h5"))
+                    else None)
+    if args.signal == 1:
+        second_truth = None
+    elif args.signal == 2:
+        if second_truth is None:
+            sys.exit("--signal 2 requires /injection_parameters_2 in --truth")
+        truth = {f"{key}_2": value for key, value in second_truth.items()}
+        second_truth = None
 
     frames = []
     for res in results:
         df = res.posterior.copy()
-        if ("geocent_time" in df.columns and not args.absolute_time
-                and not res.time_is_relative):
-            df["geocent_time"] = df["geocent_time"] - t_ref
+        if not args.absolute_time and not res.time_is_relative:
+            for time_key in ("geocent_time", "geocent_time_2"):
+                if time_key in df.columns:
+                    df[time_key] = df[time_key] - t_ref
         frames.append(df)
 
     truth_vals = None
@@ -309,7 +354,7 @@ def main():
         truth_vals = []
         for p in params:
             v = truth.get(p)
-            if v is not None and p == "geocent_time":
+            if v is not None and p in ("geocent_time", "geocent_time_2"):
                 absolute = abs(v) > 1e6
                 if args.absolute_time and not absolute:
                     v = v + t_ref
@@ -319,6 +364,11 @@ def main():
         missing = [p for p, v in zip(params, truth_vals) if v is None]
         if missing:
             print(f"  ! truth has no value for {missing}; those panels get no line")
+
+    second_truth_vals = None
+    if second_truth is not None:
+        second_truth_vals = [second_truth.get(p) for p in params]
+        print("  second-signal truth plotted at its effective post-shift time")
 
     if args.labels:
         labels = [s.strip() for s in args.labels.split(",")]
@@ -335,9 +385,16 @@ def main():
     if "geocent_time" in params:
         if args.absolute_time:
             axis_labels[params.index("geocent_time")] = r"$t_c\,[{\rm s}]$"
+        elif args.signal:
+            axis_labels[params.index("geocent_time")] = (
+                r"$t_{c,1}-t_{\mathrm{ref}}\,[{\rm s}]$")
         elif t_ref != DEFAULT_T_REF:
             axis_labels[params.index("geocent_time")] = (
                 rf"$t_c - {t_ref:.0f}\,[{{\rm s}}]$")
+    if "geocent_time_2" in params:
+        axis_labels[params.index("geocent_time_2")] = (
+            r"$t_{c,2}\,[{\rm s}]$" if args.absolute_time
+            else r"$t_{c,2}-t_{\mathrm{ref}}\,[{\rm s}]$")
 
     # plot_ranges = {
     # "chirp_mass": (1.18, 1.22),
@@ -358,13 +415,22 @@ def main():
     # )
     # for i, p in enumerate(params)
     # ]
-    ranges = [(min(a[:, i].min() for a in arrays),
-               max(a[:, i].max() for a in arrays)) for i in range(len(params))]
+    ranges = []
+    for i in range(len(params)):
+        values = [min(a[:, i].min() for a in arrays),
+                  max(a[:, i].max() for a in arrays)]
+        for truths in (truth_vals, second_truth_vals):
+            if truths is not None and truths[i] is not None:
+                values.append(truths[i])
+        lo, hi = min(values), max(values)
+        pad = 0.025 * (hi - lo) if hi > lo else 1.0
+        ranges.append((lo - pad, hi + pad))
     kde_contours = not args.hist_contours
     fig = None
-    for arr, name in zip(arrays, labels):
+    for arr_index, (arr, name) in enumerate(zip(arrays, labels)):
         fig = corner.corner(
-            arr, fig=fig, labels=axis_labels, range=ranges, bins=args.bins,
+            arr, fig=fig, color=f"C{arr_index}", labels=axis_labels,
+            range=ranges, bins=args.bins,
             smooth=args.smooth,
             plot_datapoints=False, plot_density=False, fill_contours=False,
             # Both the diagonal histogram and the binned contours are drawn
@@ -377,7 +443,31 @@ def main():
             label_kwargs=dict(fontsize=14),
             hist_kwargs=dict(density=True, lw=0.0, alpha=0.0),
             truths=truth_vals,
+            truth_color=("crimson" if args.signal else "royalblue"),
         )
+
+    if second_truth_vals is not None:
+        from matplotlib.lines import Line2D
+        second_plot_vals = [np.nan if value is None else value
+                            for value in second_truth_vals]
+        corner.overplot_lines(fig, second_plot_vals, color="crimson",
+                              linestyle="-", linewidth=1.6)
+        corner.overplot_points(fig, np.asarray(second_plot_vals)[None, :],
+                               color="crimson", marker="s", markersize=4)
+        handles = [
+            Line2D([], [], color="royalblue", lw=1.6, label="signal 1 truth"),
+            Line2D([], [], color="crimson", lw=1.6, ls="-", label="signal 2 truth"),
+        ]
+        fig.legend(handles=handles, loc="upper right",
+                   bbox_to_anchor=(0.98, 0.84), fontsize=12, frameon=False)
+    elif args.signal and truth_vals is not None:
+        from matplotlib.lines import Line2D
+        fig.legend(handles=[
+            Line2D([], [], color="C0", lw=1.6, label="Bilby posterior"),
+            Line2D([], [], color="crimson", lw=1.6,
+                   label=f"signal {args.signal} injection truth"),
+        ], loc="upper right", bbox_to_anchor=(0.98, 0.84),
+            fontsize=12, frameon=False)
 
     n_par = len(params)
     colors = []
@@ -422,7 +512,7 @@ def main():
     if len(arrays) > 1:
         for name in labels:
             fig.axes[0].plot([], [], label=name)
-        if truth_vals is not None:
+        if truth_vals is not None and second_truth_vals is None:
             fig.axes[0].plot([], [], ls="-", label="truth")
         fig.legend(loc="upper right", fontsize=16, frameon=False)
 
@@ -436,7 +526,8 @@ def main():
     out_stem, out_ext = os.path.splitext(out)
     marginal_out = args.marginal_out or f"{out_stem}_1d{out_ext or '.png'}"
     plot_marginals(frames, params, labels, axis_labels, ranges, truth_vals,
-                   args.bw, marginal_out)
+                   args.bw, marginal_out, second_truth_vals=second_truth_vals,
+                   selected_signal=args.signal)
     print(f"Saved 1D marginal plot -> {marginal_out}")
 
 

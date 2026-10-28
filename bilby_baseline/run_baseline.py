@@ -23,6 +23,13 @@ from builders import (
     generate_all_bbh_parameters_with_chi_eff,
 )
 
+from joint_builders import (
+    build_joint_prior,
+    build_joint_likelihood,
+    check_joint_injection_likelihood,
+    read_joint_injection_parameters,
+)
+
 from dingo.gw.result import Result          # noqa: E402
 
 try:
@@ -56,11 +63,17 @@ def parse_args():
                     help="dynesty number of live points.")
     ap.add_argument("--npool", type=int, default=1,
                     help="Number of parallel processes for the likelihood pool.")
+    ap.add_argument("--joint-mode", type=str, default="single", choices=["single", "joint"],
+                    help="Whether to run in single or joint mode.")
     ap.add_argument("--sampler", default="dynesty")
     ap.add_argument("--sample", default="acceptance-walk",
                     help="dynesty sampling method.")
     ap.add_argument("--naccept", type=int, default=20,
                     help="MCMC accepted steps per new point for dynesty.")
+    ap.add_argument("--nact", type=int, default=2,
+                    help="Autocorrelation lengths for dynesty act-walk proposals.")
+    ap.add_argument("--maxmcmc", type=int, default=5000,
+                    help="Maximum MCMC steps for a dynesty proposal.")
     ap.add_argument("--dlogz", type=float, default=0.1,
                     help="dynesty evidence stopping threshold.")
     ap.add_argument("--spin-mode", default=os.environ.get("SPIN_MODE", "full"),
@@ -68,10 +81,10 @@ def parse_args():
                     help="Which spin parameters the sampler explores. 'full' "
                          "(default) leaves a_1/a_2/tilt_1/tilt_2/phi_12/phi_jl/phase "
                          "free on the training prior -- the only setting that is a "
-                         "valid baseline, and the one that serves BOTH a chi_eff "
-                         "network and a raw-spin network from a single run, because "
-                         "generate_all_bbh_parameters derives chi_eff from the "
-                         "samples. 'truth' pins those seven at the injected truth: it "
+                         "valid baseline. The single-signal result derives chi_eff "
+                         "from the samples; for joint results, derive chi_eff for "
+                         "each event in post-processing. 'truth' pins those seven "
+                         "parameters for each event at the injected truth: it "
                          "hands bilby information Dingo does not have, so it is a "
                          "diagnostic/reproduction switch, NOT a baseline. Defaults "
                          "to $SPIN_MODE.")
@@ -93,6 +106,11 @@ def parse_args():
     args = ap.parse_args()
     if args.check_only and args.skip_check:
         ap.error("--check-only and --skip-check are mutually exclusive")
+    if args.joint_mode == "joint":
+        if args.outdir == "bilby_run":
+            args.outdir = "bilby_run_joint"
+        if args.label == "bilby_baseline":
+            args.label = "bilby_baseline_joint"
     # Output directories are not HDF5 files; keep the input result suffix intact.
     args.outdir = os.path.normpath(args.outdir)
     if args.outdir.endswith(".hdf5"):
@@ -123,7 +141,7 @@ def _read_truth(result_path):
         return truth
 
 
-def apply_free_params(prior, result_path, free_params, t_ref):
+def apply_free_params(prior, result_path, free_params, t_ref, joint=False):
     """Leave exactly `free_params` free; pin every other parameter at the truth.
 
     Named parameters must already exist in the prior, so a typo fails here rather
@@ -147,10 +165,11 @@ def apply_free_params(prior, result_path, free_params, t_ref):
               if k not in free and not isinstance(
                   p, (bilby.core.prior.Constraint, bilby.core.prior.DeltaFunction)
               )]
-    truth = _read_truth(result_path) if to_pin else {}
+    truth = (read_joint_injection_parameters(result_path, t_ref) if joint
+             else _read_truth(result_path)) if to_pin else {}
     # Dingo stores geocent_time relative to t_ref while the prior is on absolute GPS.
     # Pinning the raw value would put the merger ~1.1e9 s away from the data.
-    if "geocent_time" in truth:
+    if not joint and "geocent_time" in truth:
         truth["geocent_time"] += t_ref
 
     missing = sorted(k for k in to_pin if k not in truth)
@@ -182,19 +201,24 @@ def apply_free_params(prior, result_path, free_params, t_ref):
     return prior
 
 
-def apply_spin_mode(prior, result_path, spin_mode):
+def apply_spin_mode(prior, result_path, spin_mode, joint=False, t_ref=None):
 
     if spin_mode == "full":
         print(
             "spin-mode full: component spins are sampled; "
-            "chi_eff are derived from the samples.",
+            + ("chi_eff is derived from the samples."
+               if not joint else "joint derived spins require post-processing."),
             flush=True,
         )
         return prior
     # Only remaining alternative: truth mode
-    truth = _read_truth(result_path)
+    truth = (read_joint_injection_parameters(result_path, t_ref) if joint
+             else _read_truth(result_path))
     pinned = []
-    for key in PINNED_BY_TRUTH:
+    keys_to_pin = PINNED_BY_TRUTH + tuple(
+        f"{key}_2" for key in PINNED_BY_TRUTH
+    ) if joint else PINNED_BY_TRUTH
+    for key in keys_to_pin:
         if key in truth and key in prior:
             prior[key] = truth[key]
             pinned.append(f"{key}={truth[key]:.6g}")
@@ -249,8 +273,9 @@ def check_injection_likelihood(result, result_path, ifos, wfg, likelihood):
 
 def main():
     args = parse_args()
+    mode = args.joint_mode
     free_params = args.free_params.replace(",", " ").split()
-    if "chi_eff" in free_params:
+    if "chi_eff" in free_params or "chi_eff_2" in free_params:
         raise SystemExit("chi_eff is derived from component-spin posterior samples; "
                          "leave --free-params empty for the full baseline.")
 
@@ -258,11 +283,21 @@ def main():
     result = Result(file_name=args.result)
     print("Building bilby data/prior/waveform", flush=True)
     ifos, duration, sampling_frequency = build_ifos(result)
-    prior = build_prior(result, prior=args.prior)
-    if free_params:
-        prior = apply_free_params(prior, args.result, free_params, result.t_ref)
+    if mode == "joint":
+        prior = build_joint_prior(result, prior=args.prior)
+    elif mode == "single":
+        prior = build_prior(result, prior=args.prior)
     else:
-        prior = apply_spin_mode(prior, args.result, args.spin_mode)
+        raise ValueError(f"Unknown joint-mode {mode!r}")
+    if free_params:
+        prior = apply_free_params(
+            prior, args.result, free_params, result.t_ref, joint=(mode == "joint")
+        )
+    else:
+        prior = apply_spin_mode(
+            prior, args.result, args.spin_mode,
+            joint=(mode == "joint"), t_ref=result.t_ref,
+        )
     wfg = build_waveform_generator(
         result,
         duration,
@@ -276,10 +311,21 @@ def main():
 
     # Plain (non-marginalized) likelihood for both the Dingo cross-check and
     # sampling (cf. tutorial Lab 3).
-    likelihood = build_likelihood(ifos, wfg)
+    likelihood = (build_likelihood(ifos, wfg) if mode == "single"
+                  else build_joint_likelihood(ifos, wfg))
 
     if not args.skip_check:
-        check_injection_likelihood(result, args.result, ifos, wfg, likelihood)
+        if mode == "single":
+            check_injection_likelihood(result, args.result, ifos, wfg, likelihood)
+        else:
+            check = check_joint_injection_likelihood(
+                args.result, result.t_ref, likelihood
+            )
+            print(
+                f"Joint injection cross-check OK: residual={check['residual']:.6g}, "
+                f"logLR difference={check['loglr_difference']:.6g}",
+                flush=True,
+            )
     if args.check_only:
         print("Check-only completed; no sampler started.", flush=True)
         return
@@ -292,13 +338,17 @@ def main():
         nlive=args.nlive,
         sample=args.sample,
         naccept=args.naccept,
+        nact=args.nact,
+        maxmcmc=args.maxmcmc,
         dlogz=args.dlogz,
         npool=args.npool,
         outdir=args.outdir,
         label=args.label,
         check_point_delta_t=50,
-        conversion_function=generate_all_bbh_parameters_with_chi_eff,
-        result_class=bilby.gw.result.CompactBinaryCoalescenceResult,
+        conversion_function=(generate_all_bbh_parameters_with_chi_eff
+                             if mode == "single" else None),
+        result_class=(bilby.gw.result.CompactBinaryCoalescenceResult
+                      if mode == "single" else bilby.core.result.Result),
     )
 
 

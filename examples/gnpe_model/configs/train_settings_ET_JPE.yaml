@@ -1,8 +1,8 @@
 data:
-  waveform_dataset_path: training_data/waveform_dataset_ET_joint_separate_5M.hdf5
+  waveform_dataset_path: training_data/waveform_dataset_ET_joint_separate_2M.hdf5
   train_fraction: 0.95
   domain_update:
-    f_min: 20.0    # the dataset goes down to 10 Hz; raise/lower here to trade cost for band
+    f_min: 10.0
     f_max: 1024.0
   detectors:
     - ET1
@@ -85,7 +85,7 @@ training:
     scheduler:
       type: cosine
       T_max: 300
-    batch_size: 1024
+    batch_size: 512
     
     early_stopping:
       patience: 20
@@ -102,7 +102,7 @@ training:
     scheduler:
       type: cosine
       T_max: 150
-    batch_size: 512
+    batch_size: 256
     
     early_stopping:
       patience: 20
@@ -113,13 +113,13 @@ training:
 # Local settings for training that have no impact on the final trained network.
 local:
   device: cuda # Change this to 'cuda' for training on a GPU.
-  num_workers: 16  # num_workers >0 does not work on Mac, see https://stackoverflow.com/questions/64772335/pytorch-w-parallelnative-cpp206
+  num_workers: 8
   runtime_limits:
     max_time_per_run: 3600000
     max_epochs_per_run: 500
-  checkpoint_epochs: 25
+  checkpoint_epochs: 5
   leave_waveforms_on_disk: True
-  local_cache_path: /tmp # cache waveforms to local node disk to avoid BeeGFS network traffic during training
+  local_cache_path: /tmp/dingo_jpe_main # cache waveforms to local node disk
   # Local settings related to condor, remove if not used on cluster
   condor:
     num_cpus: 16
