@@ -1,0 +1,178 @@
+#!/bin/bash
+#SBATCH --job-name=main_train_ET_resume
+#SBATCH --output=logs/dingo/%x_%j.out
+#SBATCH --error=logs/dingo/%x_%j.err
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=16
+#SBATCH --partition=private-dpnc-gpu
+#SBATCH --gres=gpu:1
+#SBATCH --time=150:00:00
+#SBATCH --mem=256G
+
+# Resume the ET GNPE training from a checkpoint, e.g. after the SLURM wall clock
+# or a node failure kills ET_submission.sh.
+#
+# Nothing is re-specified here on purpose: --checkpoint and --settings_file are
+# mutually exclusive in dingo_train, and all training settings (stages, lr,
+# batch size, priors) are read back out of the .pt itself. Only
+# <train_dir>/local_settings.yaml is re-read from disk (device, num_workers,
+# checkpoint_epochs, runtime_limits, cache path).
+#
+# Usage:
+#   sbatch ET_resume_submission.sh                       # model_stage1_warmup_b1024/b512.pt, chosen by GPU memory
+#   sbatch ET_resume_submission.sh training/main_train_dir_ET/model_225.pt
+#
+# The default checkpoints are model_stage1_warmup_b{1024,512}.pt: model_stage_0.pt
+# (epoch 200, the last good model) with stage_1 replaced by
+# configs/stage1_settings_ET.yaml (freeze_rb_layer: true, lr 3e-5, 1000-step lr
+# warmup) and stage_progress.end_epochs set to [200]. Unfreezing the RB layer
+# collapses eval() -- see configs/train_settings_ET.yaml and diagnostics/.
+
+set -eo pipefail
+
+TRAIN_DIR=training/main_train_dir_ET
+DIAG=diagnostics
+
+# batch 1024 halves the wall clock per epoch (32 min vs 52-69 at batch 512) and
+# shrinks the eval-vs-train BN gap, which scales as 1/sqrt(batch). It needs more
+# VRAM than the 10 GB cards have, and SLURM may hand us any card in the
+# partition, so pick the checkpoint to match rather than risk an OOM.
+if [ -n "$1" ]; then
+    CKPT=$1
+else
+    VRAM_MB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1)
+    VRAM_MB=${VRAM_MB:-0}
+    if [ "$VRAM_MB" -ge 20000 ]; then
+        CKPT=$TRAIN_DIR/model_stage1_warmup_b1024.pt   # batch 1024, lr 3e-5, warmup 1000
+    else
+        CKPT=$TRAIN_DIR/model_stage1_warmup_b512.pt    # batch 512,  lr 3e-5, warmup 1000
+    fi
+    echo "GPU has ${VRAM_MB} MiB -> $CKPT"
+fi
+
+mkdir -p logs/dingo
+echo "HOSTNAME=$(hostname)"
+echo "PWD=$(pwd)"
+echo "CKPT=$CKPT"
+
+export PYTHONUNBUFFERED=1   # BeeGFS 512K stdout buffer makes the run look frozen
+
+module load GCCcore/12.3.0
+module load Python/3.11.3
+source $HOME/venvs/dingo_env/bin/activate
+
+# --- Preflight ----------------------------------------------------------------
+# A checkpoint written while SLURM was tearing the job down can be truncated
+# (model_latest.pt is ~4.7 GB). Load it before burning a GPU allocation, and
+# report which epoch/stage the resume will actually land in.
+PYTHONPATH=/srv/beegfs/dpnc/groups/gw/Peng/projects/dingo:$HOME/.local/lib/python3.11/site-packages \
+python - "$CKPT" <<'PY'
+import sys, torch
+d = torch.load(sys.argv[1], map_location="cpu", weights_only=False)
+epoch = d["epoch"]
+tr = d["metadata"]["train_settings"]["training"]
+stages, n = [], 0
+while f"stage_{n}" in tr:
+    stages.append(tr[f"stage_{n}"]); n += 1
+
+# Mirror train_stages: which stage we are in comes from the RECORDED end epochs
+# of finished stages, not from cumulative configured lengths. Early stopping
+# ends a stage short, and every boundary derived from the configured counts is
+# wrong from then on.
+completed = (d["metadata"].get("stage_progress") or {}).get("end_epochs")
+print(f"checkpoint OK: epoch {epoch}")
+if completed is None:
+    print("  WARNING: no recorded stage boundaries in this checkpoint. train_stages "
+          "will guess them from the configured stage lengths and warn; if any stage "
+          "ended early that guess is wrong. Set "
+          "metadata['stage_progress']['end_epochs'] before resuming.")
+    raise SystemExit(0)
+print(f"  completed stages ended at epochs {completed}")
+start = len(completed)
+if start >= len(stages):
+    print("  all stages already complete."); raise SystemExit(0)
+stage_start = completed[-1] if completed else 0
+stage = stages[start]
+fresh = epoch == stage_start
+print(f"resume lands in stage_{start} "
+      f"({'fresh optimizer from the stage settings' if fresh else 'mid-stage, optimizer/scheduler kept from checkpoint'}), "
+      f"running to epoch {stage_start + stage['epochs']}")
+print(f"  freeze_rb_layer={stage.get('freeze_rb_layer')} "
+      f"batch_size={stage['batch_size']} lr={stage['optimizer']['lr']}")
+PY
+
+# --- Protect the previous best model ------------------------------------------
+# EarlyStopping is constructed fresh for each stage entry, so best_score is None
+# on the first epoch after a resume and that epoch unconditionally overwrites
+# best_model.pt, whatever its loss.
+if [ -f "$TRAIN_DIR/best_model.pt" ]; then
+    cp -p "$TRAIN_DIR/best_model.pt" "$TRAIN_DIR/best_model_before_resume_$(date +%Y%m%d_%H%M).pt"
+    echo "Backed up best_model.pt"
+fi
+
+# --- Rewind history.txt to the resume epoch -----------------------------------
+# write_history appends for every epoch but the first, so resuming from an
+# earlier checkpoint would leave the superseded epochs interleaved with the new
+# ones and break any plot reading the file. Keep the original, truncate the copy
+# in place at the checkpoint epoch.
+RESUME_EPOCH=$(PYTHONPATH=/srv/beegfs/dpnc/groups/gw/Peng/projects/dingo:$HOME/.local/lib/python3.11/site-packages \
+    python -c "import torch,sys; print(torch.load(sys.argv[1], map_location='cpu', weights_only=False)['epoch'])" "$CKPT")
+HIST=$TRAIN_DIR/history.txt
+if [ -f "$HIST" ]; then
+    LAST=$(tail -1 "$HIST" | cut -f1)
+    if [ "$LAST" -gt "$RESUME_EPOCH" ]; then
+        cp -p "$HIST" "$TRAIN_DIR/history_before_resume_$(date +%Y%m%d_%H%M).txt"
+        awk -F'\t' -v e="$RESUME_EPOCH" '$1 <= e' "$HIST" > "$HIST.tmp" && mv "$HIST.tmp" "$HIST"
+        echo "history.txt: truncated $LAST -> $RESUME_EPOCH epochs (original backed up)"
+    fi
+fi
+
+# --- Background monitors ------------------------------------------------------
+# (a) GPU memory: batch 1024 is not proven on every card in this partition, and
+#     an OOM would hit the first batch of the stage. Sample so the peak is on
+#     record either way.
+# (b) BN health: reads only checkpoint tensors, no forward pass. RB drift must
+#     stay at 0 while freeze_rb_layer is True -- anything else means the config
+#     changed or a mechanism we have not identified is at work. Runs once per
+#     permanent checkpoint, i.e. every checkpoint_epochs (25) epochs.
+MEMLOG=$TRAIN_DIR/gpu_mem.log
+HEALTHLOG=$TRAIN_DIR/bn_health.log
+: > "$MEMLOG"
+
+( while true; do
+    printf '%s\t%s\n' "$(date +%H:%M:%S)" \
+      "$(nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader 2>/dev/null)" \
+      >> "$MEMLOG"
+    sleep 300
+  done ) &
+MEM_PID=$!
+
+( SEEN=""
+  while true; do
+    sleep 600
+    for f in "$TRAIN_DIR"/model_[0-9]*.pt; do
+        [ -f "$f" ] || continue
+        case " $SEEN " in *" $f "*) continue ;; esac
+        # let the 4.7 GB write finish before reading it
+        sleep 120
+        SEEN="$SEEN $f"
+        {
+          echo "=== $(date '+%F %T')"
+          PYTHONPATH=/srv/beegfs/dpnc/groups/gw/Peng/projects/dingo:$HOME/.local/lib/python3.11/site-packages \
+            python "$DIAG/bn_health.py" "$f" "$TRAIN_DIR/model_stage_0.pt" \
+            || echo "!!! BN HEALTH WARNING -- run $DIAG/bn_probe.py on $f before trusting eval()"
+        } >> "$HEALTHLOG" 2>&1
+    done
+  done ) &
+HEALTH_PID=$!
+
+trap 'kill $MEM_PID $HEALTH_PID 2>/dev/null || true' EXIT
+
+# --- Resume -------------------------------------------------------------------
+dingo_train --checkpoint "$CKPT" --train_dir "$TRAIN_DIR"
+
+echo
+echo "peak GPU memory seen:"
+sort -t, -k1 -n "$MEMLOG" | tail -1
+echo "BN health log: $HEALTHLOG"
+echo "Done."

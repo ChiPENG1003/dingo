@@ -8,6 +8,7 @@ import warnings
 from copy import deepcopy
 from typing import Optional, Tuple
 
+import h5py
 import numpy as np
 import torch
 import torch.multiprocessing as mp
@@ -16,6 +17,7 @@ from threadpoolctl import threadpool_limits
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 
+from dingo.core.nn.enets import LinearProjectionRB
 from dingo.core.nn.compile_utils import (
     compile_network,
     reset_graphs_if_requires_grad_changes,
@@ -211,6 +213,79 @@ def prepare_training_resume(
     return pm, wfd
 
 
+def _set_rb_layer_trainability(network, mode) -> None:
+    """
+    Apply a stage's freeze_rb_layer setting to the reduced-basis (RB) projection.
+
+    true / false freeze or train the whole RB layer, exactly as before.
+
+    "signal" freezes only the part that holds the SVD basis -- the columns acting
+    on the strain's real and imaginary channels, plus the bias -- and trains the
+    columns acting on the third input channel, 1/ASD. Those columns are initialised
+    to zero and stay zero while the layer is frozen, so with a frozen RB layer the
+    network never sees the ASD. Unfreezing the whole layer instead lets the signal
+    columns drift: nothing in the loss constrains their scale, and on the ET run
+    they grew 14.1 -> 21.0 in 16 epochs while eval() collapsed (val -10.6 -> +30).
+    "signal" keeps the basis fixed and still lets a multi-ASD stage use the ASD.
+
+    The freeze is a gradient mask. It holds exactly under Adam (zero gradient ->
+    zero moments -> zero update) but not under decoupled weight decay (AdamW).
+    """
+    rb_modules = [m for m in network.modules() if isinstance(m, LinearProjectionRB)]
+    for m in rb_modules:
+        for handle in getattr(m, "_signal_freeze_hooks", []):
+            handle.remove()
+        m._signal_freeze_hooks = []
+
+    if isinstance(mode, bool):
+        set_requires_grad_flag(network, name_contains="layers_rb", requires_grad=not mode)
+        return
+    if mode != "signal":
+        raise ValueError(f"freeze_rb_layer must be true, false or 'signal', got {mode!r}")
+    if not rb_modules:
+        raise ValueError("freeze_rb_layer: signal, but the network has no RB layer")
+
+    for m in rb_modules:
+        n_signal = 2 * m.num_bins  # columns for channel 0 (Re) and channel 1 (Im)
+        for layer in m.layers_rb:
+            layer.bias.requires_grad = False
+            layer.weight.requires_grad = True
+
+            def mask_signal_columns(grad, n=n_signal):
+                grad = grad.clone()
+                grad[:, :n] = 0
+                return grad
+
+            m._signal_freeze_hooks.append(layer.weight.register_hook(mask_signal_columns))
+
+
+def _check_stage_asd_datasets(stages: list, first_index: int = 0) -> None:
+    """
+    Check every remaining stage's ASD dataset when training starts.
+
+    A later stage's asd_dataset_path is otherwise first opened when that stage
+    begins, which for stage_1 is hundreds of epochs in. Also reports how many ASDs
+    each stage trains on, so a dataset regenerated in place is visible in the log,
+    and warns about freeze_rb_layer: signal on a single-ASD dataset, where the ASD
+    channel is constant and gives the loss nothing to learn from.
+    """
+    for offset, stage in enumerate(stages):
+        n = first_index + offset
+        path = stage["asd_dataset_path"]
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"stage_{n}: asd_dataset_path {path} does not exist")
+        with h5py.File(path, "r") as f:
+            counts = {det: int(f["asds"][det].shape[0]) for det in f["asds"]}
+        print(f"stage_{n}: {path} -- ASDs per detector: {counts}")
+        if stage.get("freeze_rb_layer") == "signal" and max(counts.values()) <= 1:
+            print(
+                f"WARNING: stage_{n} trains the RB layer's ASD columns "
+                f"(freeze_rb_layer: signal) on a single ASD per detector. That input "
+                f"channel is then constant, so there is nothing to learn; use "
+                f"freeze_rb_layer: true."
+            )
+
+
 def initialize_stage(
     pm: BasePosteriorModel,
     wfd: WaveformDataset,
@@ -288,6 +363,7 @@ def initialize_stage(
         drop_last=drop_last,
     )
 
+    pm.lr_warmup = None
     if not resume:
         # New optimizer and scheduler. If we are resuming, these should have been
         # loaded from the checkpoint.
@@ -297,35 +373,76 @@ def initialize_stage(
         pm.scheduler_kwargs = stage["scheduler"]
         pm.initialize_optimizer_and_scheduler()
 
+        # Optional linear lr warmup over the first steps of the stage; see
+        # _apply_lr_warmup in base_model.py for why a fresh Adam needs it. It must
+        # finish inside the first epoch: CosineAnnealingLR computes each epoch's lr
+        # from the current group lr, so a ramp still running at the epoch-end
+        # scheduler step would scale the whole remaining schedule down.
+        warmup_steps = int(stage.get("lr_warmup_steps", 0))
+        if warmup_steps > 0:
+            if warmup_steps > len(train_loader):
+                print(
+                    f"lr_warmup_steps {warmup_steps} exceeds the {len(train_loader)} "
+                    f"steps in one epoch; clamping to {len(train_loader)}."
+                )
+                warmup_steps = len(train_loader)
+            pm.lr_warmup = {
+                "steps": warmup_steps,
+                "step": 0,
+                "target_lrs": [g["lr"] for g in pm.optimizer.param_groups],
+            }
+            print(f"Linear lr warmup over the first {warmup_steps} steps.")
+
     # Freeze/unfreeze RB layer if necessary
     if "freeze_rb_layer" in stage:
-        if reset_graphs_if_requires_grad_changes(
-            pm.network,
-            name_contains="layers_rb",
-            requires_grad=not stage["freeze_rb_layer"],
+        mode = stage["freeze_rb_layer"]
+        if mode and world_size is not None and world_size > 1:
+            raise ValueError(
+                "Cannot freeze the RB layer during DDP training — modify "
+                "the network before wrapping it with DDP."
+            )
+        if isinstance(mode, bool) and reset_graphs_if_requires_grad_changes(
+            pm.network, name_contains="layers_rb", requires_grad=not mode
         ) and print_output:
-            print(
-                "freeze_rb_layer changes the trainable parameters: compiled graphs "
-                "(if any) discarded, the next training step (re)compiles."
+            print("freeze_rb_layer changes the trainable parameters: compiled graphs discarded.")
+        _set_rb_layer_trainability(pm.network, mode)
+        if mode == "signal" and print_output:
+            n_masked = sum(
+                2 * m.num_bins * layer.weight.shape[0]
+                for m in pm.network.modules()
+                if isinstance(m, LinearProjectionRB)
+                for layer in m.layers_rb
             )
-        if stage["freeze_rb_layer"]:
-            if world_size is not None and world_size > 1:
-                raise ValueError(
-                    "Cannot freeze the RB layer during DDP training — modify "
-                    "the network before wrapping it with DDP."
-                )
-            set_requires_grad_flag(
-                pm.network, name_contains="layers_rb", requires_grad=False
-            )
-        else:
-            set_requires_grad_flag(
-                pm.network, name_contains="layers_rb", requires_grad=True
-            )
+            print(f"RB signal weights with masked gradients: {n_masked}")
 
     if print_output:
         print_number_of_model_parameters(pm.network)
 
     return train_loader, test_loader, train_sampler
+
+
+def _infer_completed_stages(pm: BasePosteriorModel, stages: list) -> list:
+    """Reconstruct the stage boundaries of a checkpoint written before they were
+    recorded, using the old assumption that every stage ran its full length.
+
+    That assumption is exactly what early stopping breaks, so warn when the
+    checkpoint's epoch does not sit on a configured boundary: the run is then
+    either mid-stage (fine) or past a stage that ended early (not fine, and the
+    stage index inferred here will be too low).
+    """
+    end_epochs = [int(e) for e in np.cumsum([stage["epochs"] for stage in stages])]
+    n = int(np.searchsorted(end_epochs, pm.epoch + 1))
+    completed = [int(e) for e in end_epochs[:n]]
+    if pm.epoch not in ([0] + completed):
+        print(
+            f"WARNING: this checkpoint (epoch {pm.epoch}) has no recorded stage "
+            f"boundaries, so they were inferred as {completed} from the configured "
+            f"stage lengths {end_epochs}. If a stage ended early, that inference is "
+            f"wrong and training will re-enter a stage it already finished. Set "
+            f"metadata['stage_progress']['end_epochs'] on the checkpoint to the "
+            f"epochs at which stages actually ended."
+        )
+    return completed
 
 
 def train_stages(
@@ -374,16 +491,32 @@ def train_stages(
             num_stages += 1
         except KeyError:
             break
-    end_epochs = list(np.cumsum([stage["epochs"] for stage in stages]))
+    # Epoch at which each COMPLETED stage actually ended. This cannot be derived
+    # from the configured stage lengths: early stopping ends a stage before its
+    # configured epoch count, and every cumulative boundary computed from those
+    # counts is then wrong for the rest of the run -- which stage we are in,
+    # whether a new optimizer is built, when the stage ends, and whether the run
+    # is finished. Record what happened instead of assuming.
+    progress = pm.metadata.setdefault("stage_progress", {})
+    if progress.get("end_epochs") is None:
+        progress["end_epochs"] = _infer_completed_stages(pm, stages)
+    completed = progress["end_epochs"]
+    _check_stage_asd_datasets(stages[len(completed):], first_index=len(completed))
 
     resume_training = False
-    num_starting_stage = np.searchsorted(end_epochs, pm.epoch + 1)
-    for n in range(num_starting_stage, num_stages):
+    for n in range(len(completed), num_stages):
         stage = stages[n]
+        stage_start_epoch = completed[-1] if completed else 0
+        stage_end_epoch = stage_start_epoch + stage["epochs"]
 
-        if pm.epoch == end_epochs[n] - stage["epochs"]:
+        if pm.epoch == stage_start_epoch:
             if print_primary:
                 print(f"\nBeginning training stage {n}. Settings:")
+                best = os.path.join(train_dir, "best_model.pt")
+                if n > 0 and os.path.isfile(best):
+                    kept = os.path.join(train_dir, f"best_model_before_stage_{n}.pt")
+                    shutil.copy2(best, kept)
+                    print(f"Copied {best} to {kept} before stage {n}.")
                 print(yaml.dump(stage, default_flow_style=False, sort_keys=False))
             train_loader, test_loader, train_sampler = initialize_stage(
                 pm,
@@ -419,8 +552,8 @@ def train_stages(
                     "Early stopping settings invalid. Please pass 'patience', 'delta', 'metric'"
                 )
                 raise
-
-        runtime_limits.max_epochs_total = end_epochs[n]
+        stage_start = time.time()
+        runtime_limits.max_epochs_total = stage_end_epoch
         pm.train(
             train_loader=train_loader,
             test_loader=test_loader,
@@ -442,10 +575,13 @@ def train_stages(
         if local_settings.get("test_only", False):
             return True, False
 
-        if pm.epoch == end_epochs[n] and print_primary:
-            save_file = os.path.join(train_dir, f"model_stage_{n}.pt")
-            print(f"Training stage complete. Saving to {save_file}.")
-            pm.save_model(save_file, save_training_info=True)
+        stopped_early = early_stopping is not None and early_stopping.early_stop
+        if pm.epoch == stage_end_epoch or stopped_early:
+            completed.append(pm.epoch)
+            if print_primary:
+                save_file = os.path.join(train_dir, f"model_stage_{n}.pt")
+                print(f"Training stage complete. Saving to {save_file}.")
+                pm.save_model(save_file, save_training_info=True)
 
         if runtime_limits.local_limits_exceeded(pm.epoch):
             if print_primary:
@@ -453,7 +589,7 @@ def train_stages(
             resume_training = True
             break
 
-    training_finished = pm.epoch == end_epochs[-1]
+    training_finished = len(completed) == num_stages
     return training_finished, resume_training
 
 

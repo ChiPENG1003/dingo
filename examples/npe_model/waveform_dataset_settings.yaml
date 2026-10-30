@@ -1,37 +1,53 @@
 domain:
-  type: UniformFrequencyDomain
-  f_min: 20.0
-  f_max: 1024.0
+  type: UniformFrequencyDomain # MultibandedFrequencyDomain
+  f_min: 10.0
+  f_max: 2048.0
   delta_f: 0.125  # Expressions like 1.0/8.0 would require eval and are not supported
 
 waveform_generator:
-  approximant: IMRPhenomXPHM  # SEOBNRv4PHM
+  approximant: IMRPhenomD_NRTidalv2  # IMRPhenomXPHM, SEOBNRv4PHM (BBH), IMRPhenomD_NRTidalv2 (BNS)
   f_ref: 20.0
   # f_start: 15.0  # Optional setting useful for EOB waveforms. Overrides f_min when generating waveforms.
   spin_conversion_phase: 0.0
 
 # Dataset only samples over intrinsic parameters. Extrinsic parameters are chosen at train time.
+# For Neutron Star, the theoretically largest mass is aroung 5.83 solar mass
 intrinsic_prior:
-  mass_1: bilby.core.prior.Constraint(minimum=10.0, maximum=120.0, name='mass_1')
-  mass_2: bilby.core.prior.Constraint(minimum=10.0, maximum=120.0, name='mass_2')
-  chirp_mass: bilby.gw.prior.UniformInComponentsChirpMass(minimum=15.0, maximum=150.0, name='chirp_mass')
-  mass_ratio: bilby.gw.prior.UniformInComponentsMassRatio(minimum=0.125, maximum=1.0, name='mass_ratio')
+  # Initial mass choice: [1.0, 2.5]
+  mass_1: bilby.core.prior.Constraint(minimum=1.0, maximum=2.5, name='mass_1')
+  mass_2: bilby.core.prior.Constraint(minimum=1.0, maximum=2.5, name='mass_2')
+  chirp_mass: bilby.gw.prior.UniformInComponentsChirpMass(minimum=1.0, maximum=2.2, name='chirp_mass')
+  mass_ratio: bilby.gw.prior.UniformInComponentsMassRatio(minimum=0.4, maximum=1.0, name='mass_ratio')
   phase: default
-  chi_1: bilby.gw.prior.AlignedSpin(name='chi_1', a_prior=Uniform(minimum=0, maximum=0.9))
-  chi_2: bilby.gw.prior.AlignedSpin(name='chi_2', a_prior=Uniform(minimum=0, maximum=0.9))
+
+  # Tidal deformability parameters. These are only relevant for BNS waveforms.
+  lambda_1: bilby.core.prior.Uniform(minimum=3000, maximum=5000, name='lambda_1')
+  lambda_2: bilby.core.prior.Uniform(minimum=3000, maximum=5000, name='lambda_2')
+
+  # Aligned spins with a small prior range.
+  chi_1: bilby.gw.prior.AlignedSpin(name='chi_1', a_prior=Uniform(minimum=-0.1, maximum=0.1))
+  chi_2: bilby.gw.prior.AlignedSpin(name='chi_2', a_prior=Uniform(minimum=-0.1, maximum=0.1))
   theta_jn: default
+
   # Reference values for fixed (extrinsic) parameters. These are needed to generate a waveform.
-  luminosity_distance: 100.0  # Mpc
+  luminosity_distance: 40.0  # Mpc
   geocent_time: 0.0  # s
 
 # Dataset size
-num_samples: 5000000
+num_samples: 100000
 
-# Save a compressed representation of the dataset
+# Save a compressed representation of the dataset.
+# SVD compression is DISABLED: the `svd` block is removed so full-length
+# (whitened) frequency-domain polarizations are stored directly. SVD with a
+# small basis was severely under-resolved for these long BNS waveforms
+# (singular values barely decayed; reconstruction mismatch ~0.09-0.55), which
+# produced the violent oscillations in |h(f)|. Whitening is kept so read_data.py
+# still recovers the physical strain by multiplying back by the ASD.
 compression:
-  svd:
-    # Truncate the SVD basis at this size. No truncation if zero.
-    size: 200
-    num_training_samples: 50000
-    num_validation_samples: 10000
   whitening: aLIGO_ZERO_DET_high_P_asd.txt
+
+# To re-enable SVD compression, restore:
+#   svd:
+#     size: 500              # 0 = keep basis but no truncation
+#     num_training_samples: 80000
+#     num_validation_samples: 20000

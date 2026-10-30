@@ -569,6 +569,19 @@ class BasePosteriorModel(ABC):
         return self.metadata
 
 
+def _apply_lr_warmup(pm):
+    """Ramp a new stage's optimizer learning rate over its first steps."""
+    warmup = getattr(pm, "lr_warmup", None)
+    if not warmup:
+        return
+    warmup["step"] += 1
+    fraction = min(1.0, warmup["step"] / warmup["steps"])
+    for group, target in zip(pm.optimizer.param_groups, warmup["target_lrs"]):
+        group["lr"] = target * fraction
+    if warmup["step"] >= warmup["steps"]:
+        pm.lr_warmup = None
+
+
 def _dataset_len(dataloader: torch.utils.data.DataLoader) -> int:
     """Return the number of samples in a DataLoader's dataset.
 
@@ -698,6 +711,7 @@ def train_epoch(
         loss_info.cache_loss(loss=loss, n=len(data[0]))
 
         if is_step_batch:
+            _apply_lr_warmup(pm)
             if automatic_mixed_precision:
                 scaler.step(pm.optimizer)
                 scaler.update()

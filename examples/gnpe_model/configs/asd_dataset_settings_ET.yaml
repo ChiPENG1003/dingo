@@ -1,0 +1,16 @@
+dataset_settings:
+#  f_min: 0         # defaults to 0
+#  f_max: 2048      # defaults to f_s/2
+  f_s: 4096
+  time_psd: 1024
+  T: 8.0
+  window:
+    roll_off: 0.4
+    type: tukey
+  time_gap: 0          # ignored for design sensitivity curves
+  num_psds_max: 100      # ET-D is deterministic: exactly one ASD per detector
+  detectors:
+    - ET1
+    - ET2
+    - ET3
+  observing_run: ET    # design sensitivity curve (ET-D), see URL_DIRECTORY in dingo/gw/noise/utils.py
