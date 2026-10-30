@@ -4,12 +4,16 @@ from typing import List, Optional
 import numpy as np
 import torch.multiprocessing
 import torchvision
-from bilby.gw.detector import InterferometerList
 from threadpoolctl import threadpool_limits
 
 from dingo.core.utils import *
 from dingo.gw.dataset.waveform_dataset import WaveformDataset
 from dingo.gw.domains import build_domain
+from dingo.gw.derived_parameters import (
+    add_derived_parameters,
+    check_derived_parameters,
+    select_derived_parameters,
+)
 from dingo.gw.gwutils import *
 from dingo.gw.noise.asd_dataset import ASDDataset
 from dingo.gw.prior import default_inference_parameters
@@ -27,8 +31,12 @@ from dingo.gw.transforms import (
     MaskRandomTokens,
     NormalizePosition,
     ProjectOntoDetectors,
+    ProjectOntoDetectorsAndSum,
     RepackageStrainsAndASDS,
     SampleExtrinsicParameters,
+    SampleExtrinsicParametersForSignal,
+    GetDetectorTimesForSignal,
+    ApplyGNPEShiftToSignal,
     SampleNoiseASD,
     SelectStandardizeRepackageParameters,
     StrainTokenization,
@@ -68,7 +76,22 @@ def build_dataset(
         svd_size_update=data_settings.get("svd_size_update"),
         leave_waveforms_on_disk=leave_waveforms_on_disk,
     )
+
+    # Add parameters that are deterministic functions of the ones stored in the
+    # dataset (e.g., chi_eff), so that they can be used as inference parameters.
+    add_derived_parameters(wfd.parameters, get_derived_parameters(data_settings))
+
     return wfd
+
+
+def get_derived_parameters(data_settings: dict) -> list:
+    requested = data_settings.get("inference_parameters", [])
+    if requested == "default":
+        requested = default_inference_parameters
+    requested = list(requested) + list(data_settings.get("context_parameters", []))
+    explicit = list(data_settings.get("derived_parameters", []))
+    check_derived_parameters(explicit)
+    return select_derived_parameters(requested + explicit)
 
 
 def set_train_transforms(
@@ -107,7 +130,7 @@ def set_train_transforms(
             print("Omitting \n\t" + "\n\t".join([t.__name__ for t in omit_transforms]))
 
     # Build detector objects
-    ifo_list = InterferometerList(data_settings["detectors"])
+    ifo_list = get_ifo_list(data_settings["detectors"])
     ifo_names = [ifo.name for ifo in ifo_list]
 
     # By passing the wfd domain when instantiating the noise dataset, this ensures the
@@ -127,12 +150,30 @@ def set_train_transforms(
         data_settings["inference_parameters"] = default_inference_parameters
 
     ref_time = data_settings["ref_time"]
+    overlap_settings = data_settings.get("overlapping_signals")
+    if overlap_settings:
+        suffixes = ("",) + tuple(overlap_settings["suffixes"])
+        overlap_prior = get_extrinsic_prior_dict(
+            overlap_settings.get("extrinsic_prior", data_settings["extrinsic_prior"])
+        )
+    else:
+        suffixes = ("",)
+        overlap_prior = None
 
     # Build transforms.
     transforms = [
         SampleExtrinsicParameters(extrinsic_prior_dict),
         GetDetectorTimes(ifo_list, ref_time),
     ]
+    for suffix in suffixes[1:]:
+        transforms.append(
+            SampleExtrinsicParametersForSignal(
+                overlap_prior,
+                suffix=suffix,
+                time_offset_prior=overlap_settings.get("time_offset_prior"),
+            )
+        )
+        transforms.append(GetDetectorTimesForSignal(ifo_list, ref_time, suffix=suffix))
 
     extra_context_parameters = []
     if "gnpe_time_shifts" in data_settings:
@@ -146,6 +187,9 @@ def set_train_transforms(
             )
         )
         extra_context_parameters += transforms[-1].context_parameters
+        # Shift each overlapping signal with the same GNPE proxy.
+        for suffix in suffixes[1:]:
+            transforms.append(ApplyGNPEShiftToSignal(ifo_list, suffix=suffix))
     d = chirp_prior_conditioning_settings(data_settings)
     if d is not None:
         # Heterodyne the polarizations at a blurred chirp mass (the proxy, on which the
@@ -155,6 +199,7 @@ def set_train_transforms(
             ChirpPriorConditioning(d["kernel"], domain, d.get("order", 0))
         )
         extra_context_parameters += transforms[-1].context_parameters
+
 
     # Add the GNPE context to context_parameters the first time the transforms are
     # constructed. We do not want to overwrite the ordering of the parameters in
@@ -195,10 +240,17 @@ def set_train_transforms(
             wfd,
             data_settings["inference_parameters"] + data_settings["context_parameters"],
             torchvision.transforms.Compose(transforms),
+            extrinsic_suffixes=suffixes[1:],
+            extrinsic_prior_dict_suffixed=overlap_prior,
         )
         data_settings["standardization"] = standardization_dict
 
-    transforms.append(ProjectOntoDetectors(ifo_list, domain, ref_time))
+    if len(suffixes) > 1:
+        transforms.append(
+            ProjectOntoDetectorsAndSum(ifo_list, domain, ref_time, suffixes=suffixes)
+        )
+    else:
+        transforms.append(ProjectOntoDetectors(ifo_list, domain, ref_time))
     transforms.append(SampleNoiseASD(asd_dataset))
     transforms.append(WhitenAndScaleStrain(domain.noise_std))
     # We typically add white detector noise. For debugging purposes, this can be turned

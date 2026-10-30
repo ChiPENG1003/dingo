@@ -1,5 +1,4 @@
 import numpy as np
-from bilby.gw.detector import InterferometerList
 from torchvision.transforms import Compose
 
 from dingo.gw.noise.asd_dataset import ASDDataset
@@ -9,7 +8,7 @@ from dingo.gw.domains import (
 )
 from dingo.gw.domains import build_domain, build_domain_from_model_metadata
 from dingo.gw.frequency_updates import resolve_frequency_bounds
-from dingo.gw.gwutils import get_extrinsic_prior_dict
+from dingo.gw.gwutils import get_extrinsic_prior_dict, get_ifo_list
 from dingo.gw.prior import build_prior_with_defaults, split_off_extrinsic_parameters
 from dingo.gw.transforms import (
     GetDetectorTimes,
@@ -78,7 +77,7 @@ class GWSignal(object):
             self.waveform_generator = WaveformGenerator(domain=wfg_domain, **wfg_kwargs)
 
         self.t_ref = t_ref
-        self.ifo_list = InterferometerList(ifo_list)
+        self.ifo_list = get_ifo_list(ifo_list)
 
         # When we set self.whiten, the projection transforms are automatically prepared.
         self._calibration_envelope = None
@@ -464,6 +463,7 @@ class Injection(GWSignal):
                 * self.data_domain.noise_std
             )
             d = s + noise
+            # d = s
             data[ifo] = self.data_domain.update_data(d, low_value=0.0)
 
         signal["waveform"] = data

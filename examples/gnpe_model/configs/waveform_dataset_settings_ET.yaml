@@ -1,0 +1,43 @@
+domain:
+  type: UniformFrequencyDomain
+  f_min: 10.0
+  f_max: 1024.0
+  delta_f: 0.125  # Expressions like 1.0/8.0 would require eval and are not supported
+
+waveform_generator:
+  approximant: IMRPhenomXP  # SEOBNRv4PHM
+  f_ref: 20.0
+  # f_start: 15.0  # Optional setting useful for EOB waveforms. Overrides f_min when generating waveforms.
+  spin_conversion_phase: 0.0
+
+# Dataset only samples over intrinsic parameters. Extrinsic parameters are chosen at train time.
+intrinsic_prior:
+  mass_1: bilby.core.prior.Constraint(minimum=40.0, maximum=1100.0, name='mass_1')
+  mass_2: bilby.core.prior.Constraint(minimum=40.0, maximum=1100.0, name='mass_2')
+  chirp_mass: bilby.gw.prior.UniformInComponentsChirpMass(minimum=40.0, maximum=1100.0, name='chirp_mass')
+  mass_ratio: bilby.gw.prior.UniformInComponentsMassRatio(minimum=0.125, maximum=1.0, name='mass_ratio')
+  phase: default
+  a_1: bilby.core.prior.Uniform(minimum=0.0, maximum=0.9, name='a_1')
+  a_2: bilby.core.prior.Uniform(minimum=0.0, maximum=0.9, name='a_2')
+  tilt_1: default
+  tilt_2: default
+  phi_12: default
+  phi_jl: default
+  theta_jn: bilby.core.prior.Sine(minimum=0,maximum=np.pi, name='theta_jn')
+  # Reference values for fixed (extrinsic) parameters. These are needed to generate a waveform.
+  luminosity_distance: 5000.0  # Mpc
+  geocent_time: 0.0  # s  # must be 0: ProjectOntoDetectors asserts the stored polarizations are unshifted
+
+# Dataset size
+num_samples: 1000000
+
+# Save a compressed representation of the dataset
+compression:
+  svd:
+    # Truncate the SVD basis at this size. No truncation if zero.
+    size: 200
+    num_training_samples: 20000
+    num_validation_samples: 5000
+  # ET-D design curve, so the SVD basis is weighted with the ET noise budget
+  # rather than the aLIGO one. Resolved relative to the working directory.
+  whitening: ET_D_asd.txt

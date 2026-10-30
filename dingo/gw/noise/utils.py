@@ -12,7 +12,7 @@ import requests
 import yaml
 
 from gwpy.table import EventTable
-from dingo.gw.noise.asd_dataset import ASDDataset
+from dingo.gw.noise.asd_dataset import ASDDataset, HIGH_ASD_VALUE
 
 """
 Catalogue against which to check that no event is present in the estimated PSDs
@@ -51,7 +51,24 @@ URL_DIRECTORY = {
         "https://www.gw-openscience.org/timeline/segments/O3a_16KHZ_R1/V1_BURST_CAT2/1238166018/1253977218/",
         "https://www.gw-openscience.org/timeline/segments/O3b_16KHZ_R1/V1_BURST_CAT2/1256655618/1269363618/",
     ],
+    "ET_ET1": [
+        "https://raw.githubusercontent.com/bilby-dev/bilby/main/bilby/gw/detector/noise_curves/ET_D_asd.txt"
+    ],
+    "ET_ET2": [
+        "https://raw.githubusercontent.com/bilby-dev/bilby/main/bilby/gw/detector/noise_curves/ET_D_asd.txt"
+    ],
+    "ET_ET3": [
+        "https://raw.githubusercontent.com/bilby-dev/bilby/main/bilby/gw/detector/noise_curves/ET_D_asd.txt"
+    ],
 }
+
+"""
+Observing runs in URL_DIRECTORY whose URLs are design sensitivity curves (two columns:
+frequency [Hz], ASD [1/sqrt(Hz)]) rather than GWOSC segment lists. For these, no strain
+data are downloaded: the ASD is deterministic, so the dataset contains exactly one ASD
+per detector, with GPS time 0.
+"""
+DESIGN_SENSITIVITY_RUNS = {"ET"}
 
 
 def psd_data_path(data_dir, run, detector):
@@ -75,8 +92,15 @@ def psd_data_path(data_dir, run, detector):
 def get_event_gps_times():
     event_list = []
     for catalogue in CATALOGS:
-        events = EventTable.fetch_open_data(catalogue)
-        event_list += list(events["GPS"])
+        try:
+            events = EventTable.fetch_open_data(catalogue)
+            event_list += list(events["GPS"])
+        except Exception as e:
+            print(
+                f"Warning: Could not fetch event catalog '{catalogue}' from GWOSC "
+                f"({type(e).__name__}: {e}). Skipping catalog — segments containing "
+                f"events from this catalog will not be excluded."
+            )
     return event_list
 
 
@@ -98,6 +122,12 @@ def get_time_segments(settings):
     time_psd = settings["time_psd"]
     time_gap = settings["time_gap"]
     num_psds_max = settings.get("num_psds_max")
+
+    if run in DESIGN_SENSITIVITY_RUNS:
+        # A design sensitivity curve is deterministic, so there is exactly one "PSD
+        # segment" per detector and no associated GPS time. The pseudo-segment keeps
+        # the return format (and hence all downstream code) unchanged.
+        return {det: [(0, time_psd)] for det in settings["detectors"]}
 
     event_list = get_event_gps_times()
 
@@ -139,6 +169,60 @@ def get_time_segments(settings):
         time_segments[detector] = valid_segments
 
     return time_segments
+
+
+def load_design_curve_asd(url, domain, cache_dir=None):
+    """
+    Download a design sensitivity curve and interpolate it onto a dingo domain.
+
+    The file behind `url` must contain two whitespace-separated columns, frequency [Hz]
+    and ASD [1/sqrt(Hz)] -- the format of the ET-D curve referenced in URL_DIRECTORY.
+    Interpolation is done in log-log space. Frequencies not covered by the file (in
+    particular f = 0) are set to HIGH_ASD_VALUE, the same convention ASDDataset uses
+    for frequencies below f_min.
+
+    Parameters
+    ----------
+    url : str
+        Location of the two-column ASD text file, as stored in URL_DIRECTORY.
+    domain : UniformFrequencyDomain
+        Domain onto which the curve is interpolated.
+    cache_dir : str
+        If provided, the downloaded file is cached here so that repeated dataset
+        generation does not require network access.
+
+    Returns
+    -------
+    asd : np.ndarray
+        ASD evaluated on domain.sample_frequencies, i.e. on the full grid [0, f_max].
+    """
+    contents = None
+    cache_file = None
+    if cache_dir is not None:
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_file = join(cache_dir, os.path.basename(url.split("?")[0]))
+        if isfile(cache_file):
+            with open(cache_file, "r") as f:
+                contents = f.read()
+    if contents is None:
+        r = requests.get(url, allow_redirects=True)
+        r.raise_for_status()
+        contents = r.content.decode("utf-8")
+        if cache_file is not None:
+            with open(cache_file, "w") as f:
+                f.write(contents)
+
+    f_curve, asd_curve = np.loadtxt(StringIO(contents), unpack=True)
+    order = np.argsort(f_curve)
+    f_curve, asd_curve = f_curve[order], asd_curve[order]
+
+    f = np.asarray(domain.sample_frequencies, dtype=np.float64)
+    asd = np.full(len(f), HIGH_ASD_VALUE, dtype=np.float64)
+    covered = (f >= f_curve[0]) & (f <= f_curve[-1])
+    asd[covered] = np.exp(
+        np.interp(np.log(f[covered]), np.log(f_curve), np.log(asd_curve))
+    )
+    return asd
 
 
 def merge_datasets(asd_dataset_list):

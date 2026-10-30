@@ -14,7 +14,10 @@ dist/
 downloads/
 eggs/
 .eggs/
+**/logs
 lib/
+**/training/
+**/training_data/
 lib64/
 parts/
 sdist/
@@ -139,11 +142,18 @@ dmypy.json
 .pyre/
 
 # Data files
+**/bilby_injections
 *.h5
 *.hdf5
 *.npy
+*.pt
 *.npz
 *.dat
+**/picture
+**/inference/inference_result
+**/inference/injection_combo
+**/bilby_baseline/bilby_real_events
+examples/gnpe_model/construct_plot_data/
 
 # .DS_Store files for Mac OS
 .DS_Store

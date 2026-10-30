@@ -33,8 +33,10 @@ logger.name = "dingo_pipe"
 class DataGenerationInput(BilbyDataGenerationInput):
     def __init__(self, args, unknown_args, create_data=True):
         self.model = resolve_filename_with_transfer_fallback(args.model) or args.model
-        self.model_init = args.model_init and (
+        self.model_init = (
             resolve_filename_with_transfer_fallback(args.model_init) or args.model_init
+            if args.model_init is not None
+            else None
         )
 
         Input.__init__(self, args, unknown_args)

@@ -1,6 +1,6 @@
 data:
   waveform_dataset_path: training_data/waveform_dataset.hdf5  # Contains intrinsic waveforms
-  train_fraction: 0.95
+  train_fraction: 0.90
   domain_update:
     f_min: 20.0
     f_max: 1024.0
@@ -18,6 +18,8 @@ data:
   inference_parameters:
   - chirp_mass
   - mass_ratio
+  - lambda_1
+  - lambda_2
   - chi_1
   - chi_2
   - theta_jn
@@ -59,7 +61,7 @@ model:
     dropout: 0.0
     norm: BatchNorm
     svd:
-      num_training_samples: 50000
+      num_training_samples: 90000
       num_validation_samples: 10000
       size: 200
 
@@ -67,7 +69,7 @@ model:
 training:
   stage_0:
     epochs: 300
-    asd_dataset_path: training_data/asd_dataset_fiducial/asds_O1_fiducial.hdf5 # this should just contain a single fiducial ASD per detector for pretraining
+    asd_dataset_path: training_data/asd_dataset/asds_O1.hdf5 # single fiducial ASD per detector for pretraining
     freeze_rb_layer: True
     optimizer:
       type: adam
@@ -75,11 +77,11 @@ training:
     scheduler:
       type: cosine
       T_max: 300
-    batch_size: 4096
-    # early_stopping:
-    #   patience: 10
-    #   delta: 0.0
-    #   metric: validation # one of ['training, validation']
+    batch_size: 2048
+    early_stopping:
+      patience: 20
+      delta: 0.0
+      metric: validation # one of ['training, validation']
 
   stage_1:
     epochs: 150
@@ -91,7 +93,7 @@ training:
     scheduler:
       type: cosine
       T_max: 150
-    batch_size: 4096
+    batch_size: 2048
     # early_stopping:
     #   patience: 10
     #   delta: 0.0
@@ -107,7 +109,7 @@ local:
                  # When using Condor, request_gpus in the submission file is set automatically.
   # ddp_port: 12355  # Rendezvous port for DDP; use a different one per run on the same node.
   runtime_limits:
-    max_time_per_run: 3600000
+    max_time_per_run: 40000
     max_epochs_per_run: 500
   checkpoint_epochs: 50
   leave_waveforms_on_disk: True

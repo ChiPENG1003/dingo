@@ -10,4 +10,4 @@ dataset_settings:
   detectors:
     - H1
     - L1
-  observing_run: O1
+  observing_run: O2

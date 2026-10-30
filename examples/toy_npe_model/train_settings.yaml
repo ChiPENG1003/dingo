@@ -1,6 +1,6 @@
 data:
   waveform_dataset_path: training_data/waveform_dataset.hdf5  # Contains intrinsic waveforms
-  train_fraction: 0.95
+  train_fraction: 0.80
   detectors:
     - H1
     - L1
@@ -47,14 +47,14 @@ model:
     dropout: 0.0
     norm: BatchNorm
     svd:
-      num_training_samples: 1000
-      num_validation_samples: 100
+      num_training_samples: 800
+      num_validation_samples: 200
       size: 50
 
-# The first stage (and only) stage of training. 
+# The first stage (and only) stage of training.
 training:
   stage_0:
-    epochs: 20
+    epochs: 30
     asd_dataset_path: training_data/asd_dataset/asds_O1.hdf5  # this should just contain a single fiducial ASD per detector for pretraining
     freeze_rb_layer: True
     optimizer:
@@ -62,14 +62,14 @@ training:
       lr: 0.0001
     scheduler:
       type: cosine
-      T_max: 20
+      T_max: 30
     batch_size: 64
 
 # Local settings for training that have no impact on the final trained network.
 local:
   device: cpu  # Change this to 'cuda' for training on a GPU.
-  num_workers: 6  # num_workers >0 does not work on Mac, see https://stackoverflow.com/questions/64772335/pytorch-w-parallelnative-cpp206
+  num_workers: 1  # num_workers >0 does not work on Mac, see https://stackoverflow.com/questions/64772335/pytorch-w-parallelnative-cpp206
   runtime_limits:
     max_time_per_run: 3600000
-    max_epochs_per_run: 30
-  checkpoint_epochs: 15
+    max_epochs_per_run: 200
+  checkpoint_epochs: 20

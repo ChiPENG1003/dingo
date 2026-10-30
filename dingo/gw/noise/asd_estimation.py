@@ -11,7 +11,12 @@ from dingo.gw.domains import build_domain
 from dingo.gw.download_strain_data import estimate_single_psd
 from dingo.gw.gwutils import get_window
 from dingo.gw.noise.asd_dataset import ASDDataset
-from dingo.gw.noise.utils import psd_data_path
+from dingo.gw.noise.utils import (
+    DESIGN_SENSITIVITY_RUNS,
+    URL_DIRECTORY,
+    load_design_curve_asd,
+    psd_data_path,
+)
 
 
 def download_and_estimate_psds(
@@ -95,9 +100,20 @@ def download_and_estimate_psds(
                         "domain_dict": domain.domain_dict,
                     }
                 }
-                psd = estimate_single_psd(time_start=start, **estimation_kwargs)
-                asd = np.sqrt(psd[domain.min_idx : domain.max_idx + 1])
-                gps_time = start
+                if run in DESIGN_SENSITIVITY_RUNS:
+                    # No strain data exist for this detector: the ASD is given by the
+                    # design sensitivity curve referenced in URL_DIRECTORY.
+                    asd_full = load_design_curve_asd(
+                        URL_DIRECTORY[f"{run}_{det}"][0],
+                        domain,
+                        cache_dir=join(data_dir, "tmp", run),
+                    )
+                    asd = asd_full[domain.min_idx : domain.max_idx + 1]
+                    gps_time = 0
+                else:
+                    psd = estimate_single_psd(time_start=start, **estimation_kwargs)
+                    asd = np.sqrt(psd[domain.min_idx : domain.max_idx + 1])
+                    gps_time = start
 
                 dataset_dict["asds"] = {det: np.array([asd])}
                 dataset_dict["gps_times"] = {det: np.array([gps_time])}

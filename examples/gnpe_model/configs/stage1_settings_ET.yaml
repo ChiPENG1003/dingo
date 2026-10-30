@@ -1,0 +1,19 @@
+# stage_1 dict injected into a checkpoint by patch_checkpoint_stage1.py.
+# Mirrors the stage_1 block of train_settings_ET.yaml -- keep the two in sync.
+# Needed because dingo_train --checkpoint reads training settings from the .pt,
+# not the yaml. Pass --batch-size keep --lr keep, or the script rescales the lr.
+epochs: 150
+asd_dataset_path: training_data/asd_dataset_ET/asds_ET.hdf5  # a NEW multi-ASD file once it exists
+freeze_rb_layer: true      # `signal` once stage_1 uses many ASDs; never `false` for ET
+optimizer:
+  type: adam
+  lr: 3.0e-5
+scheduler:
+  type: cosine
+  T_max: 150
+lr_warmup_steps: 1000      # fresh Adam's first step otherwise took the loss -10.94 -> -6.40
+batch_size: 1024           # needs >10 GB VRAM (10.5 GB measured)
+early_stopping:
+  patience: 20
+  delta: 0.01
+  metric: validation
