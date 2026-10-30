@@ -1,0 +1,89 @@
+{
+  "sweep": "separation_clone",
+  "axis": "separation_clone",
+  "axis_label": "$D = d_L\\,\\gamma$ [Mpc]",
+  "axis_centers": [
+    0.0,
+    312.08967406865577,
+    624.1793481373115,
+    936.2690222059673,
+    1248.358696274623,
+    1560.4483703432788,
+    1872.5380444119346,
+    2184.6277184805904,
+    2496.717392549246,
+    2808.807066617902
+  ],
+  "axis_edges": [
+    -156.04483703432788,
+    156.04483703432788,
+    468.13451110298365,
+    780.2241851716394,
+    1092.3138592402952,
+    1404.403533308951,
+    1716.4932073776067,
+    2028.5828814462625,
+    2340.6725555149183,
+    2652.762229583574,
+    2964.85190365223
+  ],
+  "axis_notes": [
+    "d_2 pinned to d_1 = 894.1 Mpc, so D = d_1 * gamma and D_max = pi * d_1 = 2809 Mpc",
+    "transverse ARC at a common distance, not the 3-D chord",
+    "SNR_2 is NOT controlled: the distance is spent on d_2 = d_1, and gamma itself changes the antenna response",
+    "signal 2 is an exact clone of signal 1 except (ra, dec): SNR_2 differs only through the antenna response"
+  ],
+  "time_shifts": [
+    0.05,
+    0.06974753969812103,
+    0.09729438587881944,
+    0.13572088082974532,
+    0.18932395047073236,
+    0.2640975950252502,
+    0.36840314986403866,
+    0.5139042664010977,
+    0.7168711644368866,
+    1.0
+  ],
+  "shift_convention": "signal 2 merges this many seconds EARLIER than signal 1",
+  "model": "1M_7params_O2",
+  "model_main": "training/main_train_dir_1M_7params_O2/model_400.pt",
+  "model_init": "training/init_train_dir_7params_O2/model_latest.pt",
+  "inference_parameters": [
+    "chirp_mass",
+    "mass_ratio",
+    "luminosity_distance",
+    "geocent_time",
+    "ra",
+    "dec",
+    "psi"
+  ],
+  "target_seed": 1,
+  "target_snr1": 25.0,
+  "snr1_detectors": {
+    "H1": 11.2289840057791,
+    "L1": 22.336291505036307
+  },
+  "theta1": {
+    "chirp_mass": 57.65827118125913,
+    "mass_ratio": 0.8957067213132938,
+    "phase": 0.9057815605287021,
+    "a_1": 0.8348115134807746,
+    "a_2": 0.2744116777692272,
+    "tilt_1": 1.4168417731553846,
+    "tilt_2": 2.2855152977007336,
+    "phi_12": 2.57107400134529,
+    "phi_jl": 3.453198983306014,
+    "theta_jn": 0.3335630066108016,
+    "luminosity_distance": 894.0710576873713,
+    "geocent_time": 0.007628662643855644,
+    "dec": -0.34748751414721857,
+    "ra": 4.953843645140002,
+    "psi": 0.9525146483090433
+  },
+  "num_realizations": 100,
+  "num_samples": 1000,
+  "num_iterations": 30,
+  "nuisance_base_seed": 200000,
+  "noise_base_seed": 300000
+}
